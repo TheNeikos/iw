@@ -1,8 +1,10 @@
 use iw;
 
 fn main() {
-    for arg in std::env::args().skip(1) {
-        let scan_results = iw::scan_wifi(&arg);
-        println!("{:#?}", scan_results);
+    let interfaces = iw::interfaces().unwrap();
+
+    for interface in interfaces {
+        println!("{:?}", interface.get_name());
+        println!("{:?}", interface.get_connected_essid());
     }
 }

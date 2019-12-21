@@ -1,90 +1,72 @@
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-
+use std::ffi::{OsString, OsStr, CString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixDatagram;
+use std::fs::File;
+use std::io::Read;
 use std::mem::MaybeUninit;
-use std::ffi::{CString, CStr};
-use std::ptr::NonNull;
-use std::convert::TryInto;
 
-mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
+use libc::ioctl;
+
+mod ffi;
+mod error;
 
 #[derive(Debug)]
-pub enum IwError {
-    NoSocket(i32),
-    NoRange(i32),
-    ScanFailed(i32),
-    InvalidInterfaceName,
+pub struct Interface {
+    name: OsString,
 }
 
-#[derive(Debug)]
-pub struct AccessPoint {
-    essid: Option<String>,
-}
+impl Interface {
+    pub fn find_interface<S: AsRef<str>>(name: S) -> Result<Option<Interface>, error::InterfaceListError> {
+        let ifs = interfaces()?;
 
-pub fn scan_wifi(interface: &str) -> Result<Vec<AccessPoint>, IwError> {
-    // Opening a socket is safe
-    let sock = unsafe { ffi::iw_sockets_open() };
-
-    if sock < 0 {
-        return Err(IwError::NoSocket(sock));
+        Ok(ifs.into_iter().find(|i| i.name == name.as_ref()))
     }
 
-    let mut range: MaybeUninit<ffi::iwrange> = MaybeUninit::uninit();
+    pub fn get_connected_essid(&self) -> Result<CString, error::EssidFetchError> {
+        let socket = UnixDatagram::unbound()?;
+        let socketfd = socket.as_raw_fd();
 
-    let interface = if let Ok(interface) = CString::new(interface) {
-        interface
-    } else {
-        return Err(IwError::InvalidInterfaceName);
-    };
+        let mut wreq: ffi::iwreq = unsafe { MaybeUninit::zeroed().assume_init() };
 
-    // The socket is correctly initialized, as well as range has the correct size, thus this is
-    // safe
-    let result = unsafe { ffi::iw_get_range_info(sock, interface.as_ptr(), range.as_mut_ptr()) };
+        let mut name = [0u8; 16];
 
-    if result < 0 {
-        return Err(IwError::NoRange(result));
-    }
+        name[0..self.name.len()].copy_from_slice(self.name.as_bytes());
 
-    // If the result is >= 0 no errors were reported and we can assume that `range` is initialized
-    let range = unsafe { range.assume_init() };
+        unsafe { wreq.ifr_ifrn.ifrn_name.copy_from_slice(std::mem::transmute(&name[..])) };
 
-    let mut head: MaybeUninit<ffi::wireless_scan_head> = MaybeUninit::uninit();
+        wreq.u.essid.length = (ffi::IW_ESSID_MAX_SIZE + 1) as u16;
 
-    // head has the correct size
-    // Casting the interface as 'mut' is safe here, as the interface does _not_ get modified
-    // internally by iwlib
-    let result = unsafe { ffi::iw_scan(sock, interface.as_ptr() as *mut _, range.we_version_compiled as i32, head.as_mut_ptr()) };
+        let mut name: MaybeUninit<[u8; ffi::IW_ESSID_MAX_SIZE as usize + 1]> = MaybeUninit::uninit();
 
-    if result < 0 {
-        return Err(IwError::ScanFailed(result));
-    }
+        wreq.u.essid.pointer = name.as_mut_ptr() as *mut _;
 
-    // If the result is >= 0 no errors were reported and we can assume that `head` is initialized
-    let head = unsafe { head.assume_init() };
-
-    let mut ret = vec![];
-    let mut next = NonNull::new(head.result);
-
-    while let Some(value) = next {
-        let result = unsafe { value.as_ref() };
-
-        let config = &result.b;
-
-        let mut ap = AccessPoint { essid: None };
-
-        if config.has_essid != 0 {
-            let essid = unsafe { CStr::from_ptr(&config.essid as *const i8) };
-            ap.essid = essid.to_str().map(String::from).ok();
+        let ret = unsafe { ioctl(socketfd, ffi::SIOCGIWESSID.into(), &mut wreq as *mut _) };
+        if ret == -1 {
+            return Err(std::io::Error::last_os_error())?;
         }
 
-        next = NonNull::new(result.next);
-        unsafe { ffi::free(value.as_ptr() as *mut std::ffi::c_void) };
-
-        ret.push(ap);
+        Ok(CString::new(unsafe {&name.assume_init()[..wreq.u.essid.length as usize - 1]})?)
     }
 
-    Ok(ret)
+    pub fn get_name(&self) -> &OsStr {
+        &self.name
+    }
+}
+
+pub fn interfaces() -> Result<Vec<Interface>, error::InterfaceListError> {
+
+    let mut proc_wireless = File::open("/proc/net/wireless")?;
+
+    let mut buf = vec![];
+
+    proc_wireless.read_to_end(&mut buf)?;
+
+    Ok(buf.split(|&b| b == b'\n').skip(2)
+        .flat_map(|line| line.split(|&c| c == b':').next())
+        .flat_map(|line| line.rsplit(|c| c.is_ascii_whitespace()).next())
+        .filter(|line| line.len() != 0)
+        .map(|n| OsStr::from_bytes(n))
+        .map(|n| Interface { name: n.to_os_string() })
+        .collect())
 }
